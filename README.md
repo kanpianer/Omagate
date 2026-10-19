@@ -1,5 +1,8 @@
 # Omagate
 
+![screenshot-1](screenshot-1.png)
+![screenshot-2](screenshot-2.png)
+
 Omagate is a native Omarchy bar widget for SoftEther VPN, with first-class
 support for [VPN Gate](https://www.vpngate.net/en/) public relay servers as
 well as your own imported SoftEther accounts.
