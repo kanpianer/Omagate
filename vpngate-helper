@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""
+vpngate-helper
+Fetches, caches, and parses VPNGate public relay servers, and provides
+account creation for SoftEther VPN Client on Linux.
+"""
+
+import sys
+import os
+import time
+import json
+import base64
+import re
+import urllib.request
+import gzip
+import subprocess
+
+RE_REMOTE = re.compile(r"^remote\s+\S+\s+([0-9]+)", re.M)
+
+def get_runtime_dir():
+    uid = os.getuid()
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    state_dir = os.path.join(runtime, "softether-vpn")
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    return state_dir
+
+def get_cache_paths():
+    paths = []
+    uid = os.getuid()
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    paths.append(os.path.join(runtime, "softether-vpn", "vpngate-cache.json"))
+    user_cache = os.path.expanduser("~/.cache/omarchy/softether")
+    paths.append(os.path.join(user_cache, "vpngate-cache.json"))
+    return paths
+
+def load_cached_nodes(max_age_seconds=None):
+    for path in get_cache_paths():
+        if os.path.isfile(path):
+            try:
+                if max_age_seconds is not None:
+                    mtime = os.path.getmtime(path)
+                    if time.time() - mtime > max_age_seconds:
+                        continue
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list) and len(data) > 0:
+                        return data
+            except Exception:
+                continue
+    return None
+
+def save_cached_nodes(nodes):
+    for path in get_cache_paths():
+        try:
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(nodes, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:
+            pass
+
+def flag_for_country(code):
+    if not code or len(code) != 2:
+        return "🏳"
+    code = code.upper()
+    return chr(0x1F1E6 + ord(code[0]) - 65) + chr(0x1F1E6 + ord(code[1]) - 65)
+
+def format_speed(bps):
+    try:
+        b = float(bps)
+        if b >= 1000000000:
+            return f"{b/1000000000:.1f} Gbps"
+        if b >= 1000000:
+            return f"{b/1000000:.1f} Mbps"
+        if b >= 1000:
+            return f"{b/1000:.1f} Kbps"
+        return f"{int(b)} bps"
+    except Exception:
+        return "0 bps"
+
+def format_uptime(ms):
+    try:
+        sec = int(ms) // 1000
+        days = sec // 86400
+        hours = (sec % 86400) // 3600
+        mins = (sec % 3600) // 60
+        if days > 0:
+            return f"{days}d"
+        if hours > 0:
+            return f"{hours}h"
+        return f"{mins}m"
+    except Exception:
+        return "-"
+
+def fetch_vpngate_nodes(force=False):
+    if not force:
+        cached = load_cached_nodes(max_age_seconds=900)
+        if cached:
+            return cached
+
+    urls = [
+        "http://www.vpngate.net/api/iphone/",
+        "https://www.vpngate.net/api/iphone/"
+    ]
+
+    content = None
+    last_err = None
+    for url in urls:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                    "Accept-Encoding": "gzip"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=28) as resp:
+                data = resp.read()
+                if data[:2] == b"\x1f\x8b":
+                    try:
+                        data = gzip.decompress(data)
+                    except Exception:
+                        pass
+                decoded = data.decode("utf-8", errors="ignore")
+                if decoded and "*vpn_servers" in decoded:
+                    content = decoded
+                    break
+        except Exception as e:
+            last_err = e
+
+    if not content:
+        # Fall back to older cache if available
+        fallback = load_cached_nodes()
+        if fallback:
+            return fallback
+        sys.stderr.write(f"Failed to fetch VPN Gate nodes: {last_err}\n")
+        return []
+
+    lines = content.splitlines()
+    nodes = []
+    seen_ips = set()
+
+    for line in lines[2:]:
+        parts = line.split(",")
+        if len(parts) < 15:
+            continue
+        ip = parts[1].strip()
+        if not ip or ip in seen_ips:
+            continue
+        seen_ips.add(ip)
+
+        hostname = parts[0].strip()
+        ping = int(parts[3]) if parts[3].isdigit() else 999
+        speed = int(parts[4]) if parts[4].isdigit() else 0
+        country_long = parts[5].strip()
+        country_short = parts[6].strip().upper()
+        sessions = int(parts[7]) if parts[7].isdigit() else 0
+        uptime = int(parts[8]) if parts[8].isdigit() else 0
+        operator = parts[12].strip()
+
+        port = 443
+        b64 = parts[-1].strip()
+        if b64:
+            try:
+                ovpn = base64.b64decode(b64).decode("utf-8", errors="ignore")
+                m = RE_REMOTE.search(ovpn)
+                if m:
+                    port = int(m.group(1))
+            except Exception:
+                pass
+
+        flag = flag_for_country(country_short)
+        account_name = f"#{country_short} {ip}"
+
+        full_hostname = f"{hostname}.opengw.net" if not hostname.endswith(".net") else hostname
+
+        nodes.append({
+            "name": account_name,
+            "ip": ip,
+            "port": port,
+            "hostname": full_hostname,
+            "country": country_long,
+            "countryCode": country_short,
+            "flag": flag,
+            "ping": ping,
+            "speed": speed,
+            "speedText": format_speed(speed),
+            "sessions": sessions,
+            "uptime": uptime,
+            "uptimeText": format_uptime(uptime),
+            "operator": operator
+        })
+
+    # Sort primarily by speed descending initially
+    nodes.sort(key=lambda x: x["speed"], reverse=True)
+
+    save_cached_nodes(nodes)
+    return nodes
+
+def add_node(ip, port, name, adapter="VPN"):
+    if not ip or not port or not name:
+        sys.stderr.write("Usage: add <ip> <port> <name> [adapter]\n")
+        return 1
+
+    cmd = [
+        "vpncmd", "localhost", "/CLIENT", "/CMD", "AccountCreate",
+        name,
+        f"/SERVER:{ip}:{port}",
+        "/HUB:VPNGATE",
+        "/USERNAME:vpn",
+        f"/NICNAME:{adapter}"
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if res.returncode == 0:
+            print(f"Successfully added node '{name}'")
+            return 0
+        else:
+            err = res.stderr.strip() or res.stdout.strip()
+            sys.stderr.write(f"AccountCreate failed: {err}\n")
+            return 1
+    except Exception as e:
+        sys.stderr.write(f"Error creating account: {e}\n")
+        return 1
+
+def direct_node(ip, port, adapter="VPN"):
+    if not ip or not port:
+        sys.stderr.write("Usage: direct <ip> <port> [adapter]\n")
+        return 1
+
+    # First disconnect VPNGate_Direct if it is currently connected,
+    # so AccountDelete won't fail with "connection in progress"
+    disc_cmd = ["vpncmd", "localhost", "/CLIENT", "/CMD", "AccountDisconnect", "VPNGate_Direct"]
+    try:
+        subprocess.run(disc_cmd, capture_output=True, text=True, timeout=5)
+    except Exception:
+        pass
+
+    # Clean up existing VPNGate_Direct setting if any
+    del_cmd = ["vpncmd", "localhost", "/CLIENT", "/CMD", "AccountDelete", "VPNGate_Direct"]
+    try:
+        subprocess.run(del_cmd, capture_output=True, text=True, timeout=5)
+    except Exception:
+        pass
+
+    create_cmd = [
+        "vpncmd", "localhost", "/CLIENT", "/CMD", "AccountCreate",
+        "VPNGate_Direct",
+        f"/SERVER:{ip}:{port}",
+        "/HUB:VPNGATE",
+        "/USERNAME:vpn",
+        f"/NICNAME:{adapter}"
+    ]
+    try:
+        res = subprocess.run(create_cmd, capture_output=True, text=True, timeout=10)
+        if res.returncode == 0:
+            print(f"Configured direct connection for VPNGate_Direct -> {ip}:{port}")
+            return 0
+        else:
+            err = res.stderr.strip() or res.stdout.strip()
+            sys.stderr.write(f"AccountCreate VPNGate_Direct failed: {err}\n")
+            return 1
+    except Exception as e:
+        sys.stderr.write(f"Error configuring direct account: {e}\n")
+        return 1
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: vpngate-helper [fetch [--force] | add <ip> <port> <name> [adapter] | direct <ip> <port> [adapter]]")
+        sys.exit(1)
+
+    action = sys.argv[1]
+    if action == "fetch":
+        force = "--force" in sys.argv
+        nodes = fetch_vpngate_nodes(force=force)
+        print(json.dumps(nodes, ensure_ascii=False))
+        sys.exit(0 if nodes else 1)
+    elif action == "add":
+        if len(sys.argv) < 5:
+            sys.stderr.write("Usage: add <ip> <port> <name> [adapter]\n")
+            sys.exit(1)
+        ip = sys.argv[2]
+        port = sys.argv[3]
+        name = sys.argv[4]
+        adapter = sys.argv[5] if len(sys.argv) > 5 else "VPN"
+        sys.exit(add_node(ip, port, name, adapter))
+    elif action == "direct":
+        if len(sys.argv) < 4:
+            sys.stderr.write("Usage: direct <ip> <port> [adapter]\n")
+            sys.exit(1)
+        ip = sys.argv[2]
+        port = sys.argv[3]
+        adapter = sys.argv[4] if len(sys.argv) > 4 else "VPN"
+        sys.exit(direct_node(ip, port, adapter))
+    else:
+        sys.stderr.write(f"Unknown action: {action}\n")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

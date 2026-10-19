@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""
+vpn-file-picker
+Opens a native file chooser dialog allowing multi-selection of .vpn files.
+Outputs the chosen absolute file paths, one per line.
+"""
+
+import sys
+import os
+import shutil
+import subprocess
+
+def test_dialog():
+    try:
+        import gi
+        gi.require_version('Gtk', '3.0')
+        from gi.repository import Gtk
+        dialog = Gtk.FileChooserNative.new(
+            "Test", None, Gtk.FileChooserAction.OPEN, "Open", "Cancel"
+        )
+        dialog.set_select_multiple(True)
+        f = Gtk.FileFilter()
+        f.set_name("VPN")
+        f.add_pattern("*.vpn")
+        dialog.add_filter(f)
+        dialog.destroy()
+        print("TEST_OK")
+        return True
+    except Exception as e:
+        sys.stderr.write(f"Test failed: {e}\n")
+        return False
+
+def try_gtk():
+    try:
+        import gi
+        gi.require_version('Gtk', '3.0')
+        from gi.repository import Gtk
+    except Exception as e:
+        sys.stderr.write(f"GTK import error: {e}\n")
+        return None
+
+    # Try Gtk.FileChooserNative first (utilizes desktop portal like xdg-desktop-portal-gtk)
+    try:
+        dialog = Gtk.FileChooserNative.new(
+            "Select .vpn Files to Import",
+            None,
+            Gtk.FileChooserAction.OPEN,
+            "Import",
+            "Cancel"
+        )
+        dialog.set_select_multiple(True)
+
+        filter_vpn = Gtk.FileFilter()
+        filter_vpn.set_name("VPN Profile (*.vpn)")
+        filter_vpn.add_pattern("*.vpn")
+        filter_vpn.add_pattern("*.VPN")
+        dialog.add_filter(filter_vpn)
+
+        filter_all = Gtk.FileFilter()
+        filter_all.set_name("All Files (*.*)")
+        filter_all.add_pattern("*")
+        dialog.add_filter(filter_all)
+
+        downloads = os.path.expanduser("~/Downloads")
+        if os.path.isdir(downloads):
+            dialog.set_current_folder(downloads)
+        else:
+            dialog.set_current_folder(os.path.expanduser("~"))
+
+        res = dialog.run()
+        files = []
+        if res == Gtk.ResponseType.ACCEPT:
+            files = dialog.get_filenames()
+        dialog.destroy()
+        return files
+    except Exception as e:
+        sys.stderr.write(f"Gtk.FileChooserNative failed: {e}\n")
+
+    # Fallback to standard Gtk.FileChooserDialog
+    try:
+        dialog = Gtk.FileChooserDialog(
+            title="Select .vpn Files to Import",
+            action=Gtk.FileChooserAction.OPEN
+        )
+        dialog.add_buttons(
+            "Cancel", Gtk.ResponseType.CANCEL,
+            "Import", Gtk.ResponseType.OK
+        )
+        dialog.set_select_multiple(True)
+
+        filter_vpn = Gtk.FileFilter()
+        filter_vpn.set_name("VPN Profile (*.vpn)")
+        filter_vpn.add_pattern("*.vpn")
+        filter_vpn.add_pattern("*.VPN")
+        dialog.add_filter(filter_vpn)
+
+        filter_all = Gtk.FileFilter()
+        filter_all.set_name("All Files (*.*)")
+        filter_all.add_pattern("*")
+        dialog.add_filter(filter_all)
+
+        downloads = os.path.expanduser("~/Downloads")
+        if os.path.isdir(downloads):
+            dialog.set_current_folder(downloads)
+        else:
+            dialog.set_current_folder(os.path.expanduser("~"))
+
+        res = dialog.run()
+        files = []
+        if res == Gtk.ResponseType.OK:
+            files = dialog.get_filenames()
+        dialog.destroy()
+        return files
+    except Exception as e:
+        sys.stderr.write(f"Gtk.FileChooserDialog failed: {e}\n")
+        return None
+
+def try_zenity():
+    if not shutil.which("zenity"):
+        return None
+    try:
+        downloads = os.path.expanduser("~/Downloads")
+        start_dir = downloads if os.path.isdir(downloads) else os.path.expanduser("~")
+        cmd = [
+            "zenity",
+            "--file-selection",
+            "--multiple",
+            "--separator=\n",
+            "--title=Select .vpn Files to Import",
+            f"--filename={start_dir}/",
+            "--file-filter=VPN Profile (*.vpn) | *.vpn *.VPN",
+            "--file-filter=All Files (*.*) | *"
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            return [line.strip() for line in res.stdout.split("\n") if line.strip()]
+        return []
+    except Exception:
+        return None
+
+def main():
+    if "--test" in sys.argv:
+        if test_dialog():
+            sys.exit(0)
+        sys.exit(1)
+
+    files = try_gtk()
+    if files is None:
+        files = try_zenity()
+
+    if files:
+        for f in files:
+            print(f)
+
+if __name__ == "__main__":
+    main()

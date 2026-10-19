@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.kanpianer.omagate",
+  "name": "Omagate",
+  "version": "1.0.0",
+  "author": "kanpianer",
+  "license": "MIT",
+  "description": "SoftEther VPN and VPN Gate bar widget with one-click setup.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omagate",
+    "description": "Connect to saved SoftEther nodes or public VPN Gate relays.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "accountName": "",
+      "adapterName": "vpn_vpn",
+      "networkProfileName": "SoftEther VPN Network",
+      "refreshIntervalSec": 10
+    },
+    "schema": [
+      {
+        "key": "accountName",
+        "type": "string",
+        "label": "Preferred SoftEther account"
+      },
+      {
+        "key": "adapterName",
+        "type": "string",
+        "label": "Linux virtual adapter"
+      },
+      {
+        "key": "networkProfileName",
+        "type": "string",
+        "label": "NetworkManager profile"
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 10
+      }
+    ]
+  }
+}

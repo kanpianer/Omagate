@@ -1,0 +1,610 @@
+#!/bin/bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+umask 077
+
+readonly MAX_QUERY_BYTES=65536
+readonly MAX_ACCOUNT_DETAIL_BYTES=32768
+readonly MAX_NETWORK_BYTES=32768
+readonly MAX_RESOLVER_BYTES=16384
+readonly MAX_ROUTE_STATE_BYTES=4096
+readonly MAX_ROUTE_RECORDS=8
+readonly MAX_OUTPUT_LINES=1024
+readonly MAX_ACCOUNT_NAME_LENGTH=128
+readonly MAX_PROFILE_NAME_LENGTH=128
+readonly MAX_HOST_NAME_LENGTH=253
+
+action=${1:-}
+account_name=${2:-}
+network_profile=${3:-SoftEther VPN Network}
+adapter_name=${4:-vpn_vpn}
+runtime_root=${XDG_RUNTIME_DIR:-/run/user/$UID}
+
+runtime_dir_fd=
+state_dir_fd=
+runtime_dir_ref=
+state_dir_ref=
+route_state_file=
+active_temp_dir=
+CAPTURED_OUTPUT=
+connect_in_progress=false
+connect_start_time=0
+elapsed=0
+remaining=0
+
+fail() {
+  printf 'SoftEther VPN: %s\n' "$*" >&2
+  exit 1
+}
+
+trim() {
+  local value=$1
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  printf '%s' "$value"
+}
+
+valid_account_name() {
+  local value=$1
+  ((${#value} >= 1 && ${#value} <= MAX_ACCOUNT_NAME_LENGTH)) \
+    && [[ $value =~ ^[A-Za-z0-9#][A-Za-z0-9._@()+,#%=-]*(\ [A-Za-z0-9._@()+,#%=-]+)*$ ]]
+}
+
+valid_profile_name() {
+  local value=$1
+  ((${#value} >= 1 && ${#value} <= MAX_PROFILE_NAME_LENGTH)) \
+    && [[ $value =~ ^[A-Za-z0-9#][A-Za-z0-9._@()+,#%=-]*(\ [A-Za-z0-9._@()+,#%=-]+)*$ ]]
+}
+
+valid_adapter_name() {
+  local value=$1
+  ((${#value} >= 1 && ${#value} <= 15)) \
+    && [[ $value =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]*$ ]]
+}
+
+valid_host_name() {
+  local value=$1
+  ((${#value} >= 1 && ${#value} <= MAX_HOST_NAME_LENGTH)) \
+    && [[ $value =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
+}
+
+valid_ipv4() {
+  local value=$1 octet
+  local -a octets=()
+  [[ $value =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r -a octets <<< "$value"
+  ((${#octets[@]} == 4)) || return 1
+  for octet in "${octets[@]}"; do
+    ((10#$octet <= 255)) || return 1
+  done
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "required command '$1' is not installed"
+}
+
+validate_directory_fd() {
+  local fd=$1 expected_mode=$2 label=$3 metadata file_type owner mode
+  metadata=$(stat -Lc '%F|%u|%a' "/proc/self/fd/$fd") \
+    || fail "could not inspect the $label"
+  IFS='|' read -r file_type owner mode <<< "$metadata"
+  [[ $file_type == directory && $owner == "$UID" && $mode == "$expected_mode" ]] \
+    || fail "$label must be a private directory owned by the current user"
+}
+
+initialize_runtime() {
+  local state_path
+  [[ $runtime_root == /* && -d $runtime_root && ! -L $runtime_root ]] \
+    || fail "XDG_RUNTIME_DIR must be a real absolute directory"
+
+  exec {runtime_dir_fd}<"$runtime_root" \
+    || fail "could not open XDG_RUNTIME_DIR"
+  validate_directory_fd "$runtime_dir_fd" 700 "XDG runtime directory"
+  runtime_dir_ref="/proc/self/fd/$runtime_dir_fd"
+
+  state_path="$runtime_dir_ref/softether-vpn"
+  if [[ ! -e $state_path && ! -L $state_path ]]; then
+    mkdir -m 700 -- "$state_path" || fail "could not create the runtime state directory"
+  fi
+  [[ -d $state_path && ! -L $state_path ]] \
+    || fail "runtime state path must be a real directory"
+
+  exec {state_dir_fd}<"$state_path" \
+    || fail "could not open the runtime state directory"
+  validate_directory_fd "$state_dir_fd" 700 "runtime state directory"
+  state_dir_ref="/proc/self/fd/$state_dir_fd"
+  route_state_file="$state_dir_ref/transport-route"
+}
+
+acquire_action_lock() {
+  require_command flock
+  flock -n "$state_dir_fd" || fail "another SoftEther VPN action is already running"
+}
+
+cleanup_ephemeral() {
+  if [[ -n $active_temp_dir && $active_temp_dir == "$state_dir_ref"/* \
+      && -d $active_temp_dir && ! -L $active_temp_dir ]]; then
+    rm -f -- "$active_temp_dir/output" "$active_temp_dir/transport-route"
+    rmdir -- "$active_temp_dir" 2>/dev/null || true
+  fi
+  active_temp_dir=
+}
+
+run_capped() {
+  local byte_limit=$1 duration=$2
+  shift 2
+  local capture_file capture_fd captured_size captured_lines
+  local -a command_status=()
+
+  active_temp_dir=$(mktemp -d -- "$state_dir_ref/.capture.XXXXXX") \
+    || fail "could not create a private command-output directory"
+  capture_file="$active_temp_dir/output"
+
+  set -o noclobber
+  if ! exec {capture_fd}>"$capture_file"; then
+    set +o noclobber
+    cleanup_ephemeral
+    fail "could not create a private command-output file"
+  fi
+  set +o noclobber
+
+  set +o errexit
+  timeout --signal=TERM --kill-after=2s "${duration}s" "$@" 2>&1 \
+    | head -c "$((byte_limit + 1))" >&"$capture_fd"
+  command_status=("${PIPESTATUS[@]}")
+  set -o errexit
+  exec {capture_fd}>&-
+
+  captured_size=$(stat -c '%s' -- "$capture_file") \
+    || fail "could not inspect bounded command output"
+  captured_lines=$(wc -l < "$capture_file") \
+    || fail "could not inspect bounded command output"
+  if ((captured_size > byte_limit || captured_lines > MAX_OUTPUT_LINES)); then
+    cleanup_ephemeral
+    return 125
+  fi
+  CAPTURED_OUTPUT=$(<"$capture_file")
+  cleanup_ephemeral
+  if ((${command_status[1]} != 0 || ${command_status[0]} != 0)); then
+    return 1
+  fi
+}
+
+run_quiet() {
+  local duration=$1
+  shift
+  timeout --signal=TERM --kill-after=2s "${duration}s" "$@" >/dev/null 2>&1
+}
+
+vpn_command() {
+  run_capped "$MAX_ACCOUNT_DETAIL_BYTES" 15 vpncmd localhost /CLIENT /CMD "$@"
+}
+
+publish_transport_routes() {
+  local device=$1 gateway=$2 state_file state_fd address
+  shift 2
+
+  active_temp_dir=$(mktemp -d -- "$state_dir_ref/.route-write.XXXXXX") \
+    || fail "could not create private route state"
+  state_file="$active_temp_dir/transport-route"
+  set -o noclobber
+  if ! exec {state_fd}>"$state_file"; then
+    set +o noclobber
+    cleanup_ephemeral
+    fail "could not create private route state"
+  fi
+  set +o noclobber
+
+  for address in "$@"; do
+    printf '%s|%s|%s\n' "$device" "$gateway" "$address" >&"$state_fd"
+  done
+  exec {state_fd}>&-
+
+  mv -T -- "$state_file" "$route_state_file" \
+    || fail "could not publish route state atomically"
+  rmdir -- "$active_temp_dir" || true
+  active_temp_dir=
+}
+
+claim_transport_state() {
+  local claim_file
+  claim_file=$(mktemp -- "$state_dir_ref/.route-read.XXXXXX") \
+    || fail "could not claim route state"
+  if ! mv -T -- "$route_state_file" "$claim_file" 2>/dev/null; then
+    rm -f -- "$claim_file"
+    if [[ ! -e $route_state_file && ! -L $route_state_file ]]; then
+      printf ''
+      return 0
+    fi
+    return 1
+  fi
+  printf '%s' "$claim_file"
+}
+
+cleanup_transport_route() {
+  local claim_file metadata file_type owner mode size links
+  local line device gateway address extra line_count=0 invalid=false
+  local -a devices=() gateways=() addresses=()
+
+  claim_file=$(claim_transport_state) || return 1
+  [[ -n $claim_file ]] || return 0
+
+  metadata=$(stat -c '%F|%u|%a|%s|%h' -- "$claim_file") || invalid=true
+  if [[ $invalid == false ]]; then
+    IFS='|' read -r file_type owner mode size links <<< "$metadata"
+    [[ $file_type == "regular file" && $owner == "$UID" && $mode == 600 \
+      && $links == 1 && $size =~ ^[0-9]+$ && $size -le MAX_ROUTE_STATE_BYTES ]] \
+      || invalid=true
+  fi
+
+  if [[ $invalid == false ]]; then
+    run_capped "$MAX_ROUTE_STATE_BYTES" 2 dd if="$claim_file" iflag=nofollow status=none \
+      || invalid=true
+  fi
+  rm -f -- "$claim_file"
+
+  if [[ $invalid == false ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      ((line_count += 1))
+      if ((line_count > MAX_ROUTE_RECORDS || ${#line} > 128)); then
+        invalid=true
+        break
+      fi
+      IFS='|' read -r device gateway address extra <<< "$line"
+      if [[ -n ${extra:-} ]] || ! valid_adapter_name "$device" \
+          || ! valid_ipv4 "$gateway" || ! valid_ipv4 "$address"; then
+        invalid=true
+        break
+      fi
+      devices+=("$device")
+      gateways+=("$gateway")
+      addresses+=("$address")
+    done <<< "$CAPTURED_OUTPUT"
+  fi
+
+  [[ $invalid == false ]] || return 1
+
+  for ((line_count = 0; line_count < ${#addresses[@]}; line_count++)); do
+    run_quiet 3 nmcli device modify "${devices[line_count]}" \
+      -ipv4.routes "${addresses[line_count]}/32 ${gateways[line_count]}" || true
+  done
+}
+
+parse_server_host() {
+  local line key value line_count=0
+  SERVER_HOST=
+  while IFS= read -r line || [[ -n $line ]]; do
+    ((line_count += 1))
+    ((line_count <= 256 && ${#line} <= 1024)) \
+      || fail "VPN account details exceeded safe parsing limits"
+    [[ $line == *'|'* ]] || continue
+    key=$(trim "${line%%|*}")
+    [[ $key == "Destination VPN Server Host Name" ]] || continue
+    value=$(trim "${line#*|}")
+    valid_host_name "$value" || fail "the VPN server name is invalid"
+    SERVER_HOST=$value
+    break
+  done <<< "$CAPTURED_OUTPUT"
+  [[ -n $SERVER_HOST ]] || fail "could not determine the VPN server"
+}
+
+disconnect_competing_accounts() {
+  local target=$1 line key value current_name="" current_status="" line_count=0
+  local -a to_disconnect=()
+
+  run_capped "$MAX_QUERY_BYTES" 6 vpncmd localhost /CLIENT /CMD AccountList || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    ((line_count += 1))
+    ((line_count <= 2048 && ${#line} <= 1024)) || break
+    [[ $line == *'|'* ]] || continue
+    key=$(trim "${line%%|*}")
+    value=$(trim "${line#*|}")
+    if [[ $key == "VPN Connection Setting Name" ]]; then
+      if [[ -n $current_name && $current_name != "$target" && $current_status =~ ^(Connected|Connecting) ]]; then
+        to_disconnect+=("$current_name")
+      fi
+      current_name=$value
+      current_status=""
+    elif [[ $key == "Status" ]]; then
+      current_status=$value
+    fi
+  done <<< "$CAPTURED_OUTPUT"
+
+  if [[ -n $current_name && $current_name != "$target" && $current_status =~ ^(Connected|Connecting) ]]; then
+    to_disconnect+=("$current_name")
+  fi
+
+  for acc in "${to_disconnect[@]}"; do
+    run_quiet 5 vpncmd localhost /CLIENT /CMD AccountDisconnect "$acc" || true
+  done
+}
+
+find_physical_route() {
+  local line token gateway device line_count=0 token_count
+  local -a fields=()
+  PHYSICAL_GATEWAY=
+  PHYSICAL_DEVICE=
+
+  run_capped "$MAX_NETWORK_BYTES" 5 ip -4 route show default \
+    || fail "could not inspect the physical IPv4 route"
+  while IFS= read -r line || [[ -n $line ]]; do
+    ((line_count += 1))
+    ((line_count <= 64 && ${#line} <= 512)) \
+      || fail "physical route output exceeded safe parsing limits"
+    read -r -a fields <<< "$line"
+    token_count=${#fields[@]}
+    ((token_count <= 64)) || fail "physical route output exceeded safe parsing limits"
+    gateway=
+    device=
+    for ((token = 0; token < token_count; token++)); do
+      if [[ ${fields[token]} == via && $((token + 1)) -lt token_count ]]; then
+        gateway=${fields[token + 1]}
+      elif [[ ${fields[token]} == dev && $((token + 1)) -lt token_count ]]; then
+        device=${fields[token + 1]}
+      fi
+    done
+    if [[ -n $gateway && -n $device && $device != "$adapter_name" ]] \
+        && valid_ipv4 "$gateway" && valid_adapter_name "$device"; then
+      PHYSICAL_GATEWAY=$gateway
+      PHYSICAL_DEVICE=$device
+      break
+    fi
+  done <<< "$CAPTURED_OUTPUT"
+  [[ -n $PHYSICAL_GATEWAY && -n $PHYSICAL_DEVICE ]] \
+    || fail "no valid physical IPv4 default route is available"
+}
+
+resolve_server_addresses() {
+  local server_host=$1 line address socket remainder line_count=0
+  local -A seen=()
+  SERVER_ADDRESSES=()
+
+  run_capped "$MAX_RESOLVER_BYTES" 4 getent ahostsv4 "$server_host" \
+    || fail "could not resolve the VPN server"
+  while IFS= read -r line || [[ -n $line ]]; do
+    ((line_count += 1))
+    ((line_count <= 128 && ${#line} <= 512)) \
+      || fail "VPN server address output exceeded safe parsing limits"
+    read -r address socket remainder <<< "$line"
+    [[ $socket == STREAM ]] || continue
+    valid_ipv4 "$address" || continue
+    [[ -z ${seen[$address]+present} ]] || continue
+    ((${#SERVER_ADDRESSES[@]} < MAX_ROUTE_RECORDS)) \
+      || fail "the VPN server resolved to too many addresses"
+    seen[$address]=1
+    SERVER_ADDRESSES+=("$address")
+  done <<< "$CAPTURED_OUTPUT"
+  ((${#SERVER_ADDRESSES[@]} > 0)) || fail "could not resolve the VPN server"
+}
+
+prepare_transport_route() {
+  local address
+  vpn_command AccountGet "$account_name" || fail "could not read the selected VPN account"
+  parse_server_host
+  find_physical_route
+  resolve_server_addresses "$SERVER_HOST"
+
+  cleanup_transport_route || fail "existing route state was unsafe"
+  publish_transport_routes "$PHYSICAL_DEVICE" "$PHYSICAL_GATEWAY" "${SERVER_ADDRESSES[@]}"
+
+  for address in "${SERVER_ADDRESSES[@]}"; do
+    run_quiet 5 nmcli device modify "$PHYSICAL_DEVICE" \
+      +ipv4.routes "$address/32 $PHYSICAL_GATEWAY" \
+      || fail "could not protect the route to the VPN server"
+  done
+}
+
+cleanup_failed_connection() {
+  local exit_code=$?
+  trap - EXIT INT TERM
+  cleanup_ephemeral
+  if [[ $connect_in_progress == true && $exit_code -ne 0 ]]; then
+    run_quiet 5 nmcli --wait 3 connection down id "$network_profile" || true
+    vpn_command AccountDisconnect "$account_name" || true
+    cleanup_transport_route || true
+  fi
+  exit "$exit_code"
+}
+
+trap cleanup_failed_connection EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+case "$action" in
+  accounts|address|routes|connect|disconnect|delete|rename|import) ;;
+  *) fail "expected accounts, address, routes, connect, disconnect, delete, rename, or import" ;;
+esac
+
+for dependency in timeout head stat mktemp mv rm rmdir dd wc; do
+  require_command "$dependency"
+done
+initialize_runtime
+
+case "$action" in
+  accounts)
+    require_command vpncmd
+    run_capped "$MAX_QUERY_BYTES" 6 vpncmd localhost /CLIENT /CMD AccountList \
+      || fail "could not query SoftEther accounts within safe limits"
+    printf '%s' "$CAPTURED_OUTPUT"
+    ;;
+  address)
+    require_command ip
+    adapter_name=$account_name
+    valid_adapter_name "$adapter_name" || fail "invalid virtual adapter setting"
+    run_capped "$MAX_NETWORK_BYTES" 5 ip -j address show dev "$adapter_name" \
+      || fail "could not query the virtual adapter within safe limits"
+    printf '%s' "$CAPTURED_OUTPUT"
+    ;;
+  routes)
+    require_command ip
+    run_capped "$MAX_NETWORK_BYTES" 5 ip -j route show default \
+      || fail "could not query default routes within safe limits"
+    printf '%s' "$CAPTURED_OUTPUT"
+    ;;
+  connect|disconnect)
+    for dependency in vpncmd nmcli ip getent flock; do
+      require_command "$dependency"
+    done
+    valid_account_name "$account_name" || fail "invalid SoftEther account setting"
+    valid_profile_name "$network_profile" || fail "invalid NetworkManager profile setting"
+    valid_adapter_name "$adapter_name" || fail "invalid virtual adapter setting"
+    acquire_action_lock
+    run_quiet 5 nmcli connection show id "$network_profile" \
+      || fail "the configured NetworkManager profile is missing"
+
+    if [[ $action == connect ]]; then
+      connect_start_time=$SECONDS
+      connect_in_progress=true
+      disconnect_competing_accounts "$account_name"
+      prepare_transport_route
+      vpn_command AccountConnect "$account_name" \
+        || fail "could not start the selected VPN account"
+      elapsed=$((SECONDS - connect_start_time))
+      remaining=$((9 - elapsed))
+      if ((remaining <= 0)); then
+        fail "connection timed out after 9 seconds"
+      fi
+      if ! run_capped "$MAX_QUERY_BYTES" "$((remaining + 1))" nmcli --wait "$remaining" connection up \
+          id "$network_profile" ifname "$adapter_name"; then
+        fail "connection timed out or failed to complete routing within 9 seconds"
+      fi
+      connect_in_progress=false
+    else
+      run_quiet 12 nmcli --wait 10 connection down id "$network_profile" || true
+      disconnect_failed=false
+      if ! vpn_command AccountDisconnect "$account_name"; then
+        if [[ $CAPTURED_OUTPUT =~ "Error code: 37" || $CAPTURED_OUTPUT =~ "not connected" ]]; then
+          disconnect_failed=false
+        else
+          disconnect_failed=true
+        fi
+      fi
+      cleanup_transport_route || fail "stored route state was unsafe"
+      [[ $disconnect_failed == false ]] \
+        || fail "could not disconnect the selected VPN account"
+    fi
+    ;;
+  delete)
+    for dependency in vpncmd nmcli ip flock; do
+      require_command "$dependency"
+    done
+    valid_account_name "$account_name" || fail "invalid SoftEther account setting"
+    acquire_action_lock
+    run_quiet 12 nmcli --wait 10 connection down id "$network_profile" || true
+    cleanup_transport_route || true
+    run_quiet 15 vpn_command AccountDisconnect "$account_name" || true
+    vpn_command AccountDelete "$account_name" \
+      || fail "could not delete the selected VPN account"
+    ;;
+  rename)
+    for dependency in vpncmd flock; do
+      require_command "$dependency"
+    done
+    new_account_name=${3:-}
+    valid_account_name "$account_name" || fail "invalid SoftEther account setting"
+    valid_account_name "$new_account_name" || fail "invalid new SoftEther account name"
+    if [[ "$account_name" == "$new_account_name" ]]; then
+      exit 0
+    fi
+    acquire_action_lock
+    if ! vpn_command AccountRename "$account_name" "/NEW:$new_account_name"; then
+      if [[ $CAPTURED_OUTPUT =~ "already exists" ]]; then
+        fail "an account with the name '$new_account_name' already exists"
+      fi
+      fail "could not rename the selected VPN account"
+    fi
+    ;;
+  import)
+    require_command vpncmd
+    acquire_action_lock
+    shift
+    (($# > 0)) || fail "no .vpn files specified for import"
+
+    declare -A known_ips=()
+    set +o errexit
+    existing_list=$(timeout --signal=TERM --kill-after=2s 10s vpncmd localhost /CLIENT /CMD AccountList 2>/dev/null)
+    set -o errexit
+
+    while IFS= read -r host_entry; do
+      [[ -z "$host_entry" ]] && continue
+      host_entry="${host_entry#"${host_entry%%[![:space:]]*}"}"
+      host_entry="${host_entry%"${host_entry##*[![:space:]]}"}"
+      if [[ "$host_entry" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        known_ips["$host_entry"]=1
+      elif [[ -n "$host_entry" ]]; then
+        resolved=$(getent ahosts "$host_entry" 2>/dev/null | awk '{print $1; exit}')
+        known_ips["${resolved:-$host_entry}"]=1
+      fi
+    done < <(printf '%s\n' "$existing_list" | awk -F'|' '
+      tolower($1) ~ /vpn server hostname|server hostname/ {
+        split($2, parts, ":")
+        gsub(/^[ \t]+|[ \t]+$/, "", parts[1])
+        if (parts[1] != "") print parts[1]
+      }
+    ')
+
+    imported_count=0
+    skipped_count=0
+    failed_count=0
+    last_error=""
+    for file in "$@"; do
+      if [[ ! -f "$file" || ! -r "$file" ]]; then
+        failed_count=$((failed_count + 1))
+        last_error="File not found or unreadable: $(basename -- "$file")"
+        continue
+      fi
+      file_dir=$(dirname -- "$file")
+      file_name=$(basename -- "$file")
+
+      file_host=$(awk '$1 == "string" && $2 == "Hostname" { gsub(/\r/, "", $3); print $3; exit }' "$file" 2>/dev/null)
+      file_host="${file_host#"${file_host%%[![:space:]]*}"}"
+      file_host="${file_host%"${file_host##*[![:space:]]}"}"
+      file_ip=""
+      if [[ "$file_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        file_ip="$file_host"
+      elif [[ -n "$file_host" ]]; then
+        resolved=$(getent ahosts "$file_host" 2>/dev/null | awk '{print $1; exit}')
+        file_ip="${resolved:-$file_host}"
+      fi
+
+      if [[ -n "$file_ip" && -n "${known_ips["$file_ip"]:-}" ]]; then
+        skipped_count=$((skipped_count + 1))
+        continue
+      fi
+
+      if [[ -n "$file_ip" ]]; then
+        known_ips["$file_ip"]=1
+      fi
+
+      set +o errexit
+      import_out=$(cd -- "$file_dir" && timeout --signal=TERM --kill-after=2s 15s vpncmd localhost /CLIENT /CMD AccountImport "./$file_name" 2>&1)
+      import_status=$?
+      set -o errexit
+      if ((import_status == 0)); then
+        imported_count=$((imported_count + 1))
+      else
+        if [[ -n "$file_ip" ]]; then
+          unset 'known_ips["$file_ip"]'
+        fi
+        failed_count=$((failed_count + 1))
+        last_error="Failed to import $file_name"
+      fi
+    done
+    if ((imported_count == 0 && skipped_count > 0 && failed_count == 0)); then
+      printf 'All nodes match existing IPs; skipped import (%d skipped)\n' "$skipped_count"
+    elif ((imported_count == 0 && failed_count > 0)); then
+      fail "${last_error:-could not import VPN file}"
+    else
+      printf 'Successfully imported %d VPN node profile(s)' "$imported_count"
+      if ((skipped_count > 0)); then
+        printf ' (%d duplicate IP(s) skipped)' "$skipped_count"
+      fi
+      if ((failed_count > 0)); then
+        printf ' (%d failed)' "$failed_count"
+      fi
+      printf '\n'
+    fi
+    ;;
+esac

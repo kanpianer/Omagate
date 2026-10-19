@@ -1,0 +1,224 @@
+#!/bin/bash
+
+# One-time setup for the SoftEther bar widget.
+#
+#   softether-setup check   <tap> <profile>   Print setup state as JSON.
+#   softether-setup prepare <tap> <profile>   Start/enable the client, create
+#                                             the adapter and the NM profile.
+#   softether-setup install                   Open a terminal and install the
+#                                             AUR package (needs the user's
+#                                             password, so it cannot run here).
+#
+# Privileged steps are deliberately small and idempotent. `systemctl` and
+# `nmcli` are called as the user first; Omarchy's polkit agent authenticates
+# graphical callers, and `pkexec` is only a fallback when that fails.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+SERVICE="softethervpn-client"
+DEFAULT_ADAPTER="vpn_vpn"
+DEFAULT_PROFILE="SoftEther VPN Network"
+
+fail() {
+  printf 'SoftEther setup: %s\n' "$*" >&2
+  exit 1
+}
+
+valid_adapter() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}$ ]]
+}
+
+valid_profile() {
+  [[ -n $1 && ${#1} -le 128 ]] || return 1
+  [[ $1 != *"|"* && $1 != *$'\n'* && $1 != *$'\t'* ]]
+}
+
+client_present() { command -v vpncmd >/dev/null 2>&1; }
+service_active() { systemctl is-active --quiet "$SERVICE" 2>/dev/null; }
+service_enabled() { systemctl is-enabled --quiet "$SERVICE" 2>/dev/null; }
+profile_present() { nmcli -t -f NAME connection show 2>/dev/null | grep -Fxq -- "$profile"; }
+profile_ifname() { nmcli -g connection.interface-name connection show "$profile" 2>/dev/null | head -n 1; }
+adapter_present() { ip link show "$adapter" >/dev/null 2>&1; }
+
+nic_for_adapter() {
+  local name=$1
+  if [[ $name == vpn_* ]]; then
+    printf '%s' "${name#vpn_}"
+  else
+    printf '%s' "$name"
+  fi
+}
+
+nic_listed() {
+  local nic=$1
+  vpncmd localhost /CLIENT /CMD NicList 2>/dev/null | awk -F'|' -v name="$nic" '
+    $1 == "Virtual Network Adapter Name" {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+      if ($2 == name) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+run_privileged() {
+  if "$@" >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v pkexec >/dev/null 2>&1; then
+    pkexec "$@" >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+print_check() {
+  local client=false active=false enabled=false link=false has_profile=false matches=false
+  local nic tap ifname=""
+
+  if client_present; then client=true; fi
+  if service_active; then active=true; fi
+  if service_enabled; then enabled=true; fi
+  if adapter_present; then link=true; fi
+  if profile_present; then
+    has_profile=true
+    ifname=$(profile_ifname)
+    if [[ $ifname == "$adapter" ]]; then matches=true; fi
+  fi
+
+  nic=$(nic_for_adapter "$adapter")
+  tap="vpn_${nic}"
+
+  jq -n \
+    --argjson client "$client" \
+    --argjson serviceActive "$active" \
+    --argjson serviceEnabled "$enabled" \
+    --argjson adapterPresent "$link" \
+    --argjson profilePresent "$has_profile" \
+    --argjson profileMatches "$matches" \
+    --arg adapter "$adapter" \
+    --arg nic "$nic" \
+    --arg tap "$tap" \
+    --arg profile "$profile" \
+    --arg profileIfname "$ifname" \
+    --argjson ready "$(if [[ $client == true && $active == true && $enabled == true && $link == true && $has_profile == true && $matches == true ]]; then echo true; else echo false; fi)" \
+    '{
+      client: $client,
+      serviceActive: $serviceActive,
+      serviceEnabled: $serviceEnabled,
+      adapterPresent: $adapterPresent,
+      profilePresent: $profilePresent,
+      profileMatches: $profileMatches,
+      adapter: $adapter,
+      nic: $nic,
+      tap: $tap,
+      profile: $profile,
+      profileIfname: $profileIfname,
+      ready: $ready
+    }'
+}
+
+check() {
+  if ! command -v jq >/dev/null 2>&1; then
+    fail "jq is required to inspect setup state"
+  fi
+  print_check
+}
+
+prepare() {
+  client_present || fail "the SoftEther VPN client is missing (install softethervpn first)"
+  command -v vpncmd >/dev/null 2>&1 || fail "vpncmd is missing"
+  [[ $adapter == vpn_* ]] \
+    || fail "adapter name must start with vpn_ (SoftEther names the TAP vpn_<nic>)"
+
+  if ! service_active || ! service_enabled; then
+    printf 'Enabling the SoftEther client service...\n'
+    run_privileged systemctl enable --now "$SERVICE" \
+      || fail "could not enable $SERVICE (authentication was declined?)"
+  fi
+
+  local waited=0
+  until service_active; do
+    if (( waited >= 50 )); then
+      fail "$SERVICE did not become active"
+    fi
+    sleep 0.2
+    waited=$((waited + 1))
+    printf 'Waiting for the SoftEther client service...\n'
+  done
+
+  local nic
+  nic=$(nic_for_adapter "$adapter")
+
+  if nic_listed "$nic"; then
+    # Enabling an already-enabled adapter is harmless; keep going either way.
+    vpncmd localhost /CLIENT /CMD NicEnable "$nic" >/dev/null 2>&1 || true
+  else
+    printf 'Creating the virtual adapter %s...\n' "$nic"
+    vpncmd localhost /CLIENT /CMD NicCreate "$nic" >/dev/null \
+      || fail "could not create the virtual adapter '$nic'"
+    vpncmd localhost /CLIENT /CMD NicEnable "$nic" >/dev/null \
+      || fail "could not enable the virtual adapter '$nic'"
+  fi
+
+  waited=0
+  until adapter_present; do
+    if (( waited >= 25 )); then
+      fail "the adapter '$adapter' did not appear (expected tap 'vpn_$nic')"
+    fi
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+
+  if profile_present; then
+    local ifname
+    ifname=$(profile_ifname)
+    [[ $ifname == "$adapter" ]] \
+      || fail "NetworkManager profile '$profile' already uses interface '$ifname'"
+  else
+    printf 'Adding the NetworkManager profile...\n'
+    local -a add_cmd=(
+      nmcli connection add type tun
+      ifname "$adapter"
+      con-name "$profile"
+      mode tap
+      ipv4.method auto
+      ipv6.method auto
+      connection.autoconnect no
+    )
+    run_privileged "${add_cmd[@]}" \
+      || fail "could not create the NetworkManager profile '$profile'"
+  fi
+
+  printf 'Setup complete.\n'
+}
+
+install() {
+  if ! command -v omarchy-pkg-aur-add >/dev/null 2>&1; then
+    fail "omarchy-pkg-aur-add is missing; install yay and the softethervpn package"
+  fi
+
+  local command_line="omarchy-pkg-aur-add softethervpn"
+
+  if command -v omarchy-launch-floating-terminal-with-presentation >/dev/null 2>&1; then
+    exec omarchy-launch-floating-terminal-with-presentation "$command_line"
+  fi
+  if command -v foot >/dev/null 2>&1; then
+    exec foot -e bash -lc "$command_line || yay -S --needed softethervpn"
+  fi
+  fail "no terminal launcher is available to run the AUR install"
+}
+
+action=${1:-check}
+adapter=${2:-$DEFAULT_ADAPTER}
+profile=${3:-$DEFAULT_PROFILE}
+
+valid_adapter "$adapter" || fail "invalid adapter name '$adapter'"
+valid_profile "$profile" || fail "invalid NetworkManager profile name '$profile'"
+
+case "$action" in
+  check) check ;;
+  prepare) prepare ;;
+  install) install ;;
+  *) fail "unknown action '$action'" ;;
+esac
