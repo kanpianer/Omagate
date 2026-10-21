@@ -18,6 +18,13 @@ Panel {
   property int accountIndex: 0
   property bool cursorActive: false
 
+  property string pluginVersion: ""
+  readonly property string pluginVersionLabel: {
+    var version = root.pluginVersion
+    if (version === "") return ""
+    return version.charAt(0).toLowerCase() === "v" ? version : "v" + version
+  }
+
   property var customOrder: Model.asArray(root.settings ? root.settings.accountOrder : null)
 
   onSettingsChanged: {
@@ -468,6 +475,20 @@ Panel {
     pendingAccount = null
   }
 
+  // The shell hands bar widgets only the bar, module name, and settings, so the
+  // version comes from the installed manifest itself. Watching the file also
+  // means the badge shows the new number immediately after an update, even
+  // when the running QML is still the cached pre-update copy.
+  FileView {
+    id: manifestFile
+    path: Quickshell.env("HOME") + "/.config/omarchy/plugins/" + root.moduleName + "/manifest.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.pluginVersion = Model.pluginVersion(text())
+    onFileChanged: reload()
+    onLoadFailed: root.pluginVersion = ""
+  }
+
   Service {
     id: vpn
     settings: root.settings
@@ -497,6 +518,7 @@ Panel {
     function toggleVpn(): string { vpn.toggle(); return "ok" }
     function refresh(): string { vpn.refresh(); return "ok" }
     function status(): string { return vpn.statusText }
+    function version(): string { return root.pluginVersionLabel }
   }
 
   BarIconButton {
@@ -690,6 +712,20 @@ Panel {
               font.letterSpacing: 1.0
               elide: Text.ElideRight
             }
+          }
+
+          Text {
+            visible: root.pluginVersionLabel !== ""
+            text: root.pluginVersionLabel
+            textFormat: Text.PlainText
+            color: root.dim
+            opacity: 0.8
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.letterSpacing: 0.5
+            Layout.alignment: Qt.AlignTop | Qt.AlignRight
+            Layout.topMargin: Style.space(2)
+            Layout.leftMargin: Style.space(4)
           }
         }
 
