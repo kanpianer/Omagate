@@ -206,5 +206,17 @@ assert.equal(byPingDesc[0].ping, 50)
 assert.equal(byPingDesc[1].ping, 15)
 assert.equal(byPingDesc[2].ping, 8)
 
+// The version badge reads the installed manifest, so only a plain version
+// token may reach the UI. Anything malformed or oversized stays hidden.
+assert.equal(model.pluginVersion('{"version":"1.1.0"}'), "1.1.0")
+assert.equal(model.pluginVersion('{"version":"1.1.0-beta.1"}'), "1.1.0-beta.1")
+assert.equal(model.pluginVersion('{"version":"v2"}'), "v2")
+assert.equal(model.pluginVersion('{"version":"1.0.0\\nDROP"}'), "")
+assert.equal(model.pluginVersion('{"version":"<b>1.0.0</b>"}'), "")
+assert.equal(model.pluginVersion('{"version":""}'), "")
+assert.equal(model.pluginVersion('{"name":"no version"}'), "")
+assert.equal(model.pluginVersion("not json"), "")
+assert.equal(model.pluginVersion(null), "")
+
 console.log("model state tests passed")
 

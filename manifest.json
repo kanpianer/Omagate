@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.kanpianer.omagate",
   "name": "Omagate",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "kanpianer",
   "license": "MIT",
   "description": "SoftEther VPN and VPN Gate bar widget with one-click setup.",

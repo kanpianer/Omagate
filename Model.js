@@ -11,6 +11,9 @@ var MAX_PROFILE_NAME_LENGTH = 128
 var RE_SPACE_ENCODED = /\$20/g
 var RE_VALID_SETTING = /^[A-Za-z0-9#][A-Za-z0-9._@()+,#%=-]*( [A-Za-z0-9._@()+,#%=-]+)*$/
 var RE_VALID_ADAPTER = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/
+// A version is only ever shown, but the manifest is remote input, so keep the
+// badge to a short token rather than trusting whatever lands there.
+var RE_VALID_VERSION = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,31}$/
 var RE_SPACES = /\s+/g
 var RE_STATUS_OFFLINE = /disconnect|offline|not connected|disabled|stopped/
 var RE_STATUS_CONNECTING = /connecting|retry|negotiat/
@@ -55,6 +58,22 @@ function settingsError(accountName, profileName, adapterName) {
   if (!validProfileName(profileName)) return "Invalid NetworkManager profile setting"
   if (!validAdapterName(adapterName)) return "Invalid virtual adapter setting"
   return ""
+}
+
+// Read the version the panel badge shows straight from the installed
+// manifest.json. Deriving it from the file, rather than a second constant,
+// keeps the badge honest after `omarchy plugin update` and after a manifest
+// is hand-edited.
+function pluginVersion(manifestText) {
+  var manifest = null
+  try {
+    manifest = JSON.parse(String(manifestText || ""))
+  } catch (e) {
+    return ""
+  }
+  if (!manifest || typeof manifest !== "object") return ""
+  var version = String(manifest.version || "")
+  return RE_VALID_VERSION.test(version) ? version : ""
 }
 
 function elideError(value) {
@@ -317,6 +336,7 @@ if (typeof module !== "undefined") {
     validProfileName: validProfileName,
     validAdapterName: validAdapterName,
     settingsError: settingsError,
+    pluginVersion: pluginVersion,
     elideError: elideError,
     tableRow: tableRow,
     statusKind: statusKind,

@@ -30,6 +30,8 @@ Repository: <https://github.com/kanpianer/Omagate>
   SoftEther client still lists the session as connected.
 - Protects the VPN server's physical route before making the tunnel the default
   route, preventing the tunnel from trying to carry its own transport.
+- Shows the installed version in the top-right corner of the panel, read from
+  `manifest.json`, so an update is visible at a glance.
 
 ## Requirements
 
@@ -159,6 +161,28 @@ bash test/security-hardening.test.sh
 ```bash
 omarchy plugin update io.github.kanpianer.omagate
 ```
+
+The command fetches the repository's default branch, shows the diff, and asks
+for confirmation. Pass `--yes` when running it from a script or anywhere without
+an interactive terminal:
+
+```bash
+omarchy plugin update io.github.kanpianer.omagate --yes
+```
+
+The version badge in the top-right corner of the panel shows the installed
+release. Omarchy's plugin hot-reload can keep serving compiled QML from before an
+update, so if the badge changes but the widget still behaves like the old
+version, restart the shell once:
+
+```bash
+omarchy restart shell
+```
+
+Updates are fast-forwards of the git checkout. If the command reports local
+changes, review and discard them in
+`~/.config/omarchy/plugins/io.github.kanpianer.omagate` before retrying; do not
+edit files in that directory while developing.
 
 ## Removal
 
