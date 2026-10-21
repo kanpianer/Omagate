@@ -7,15 +7,39 @@ account creation for SoftEther VPN Client on Linux.
 
 import sys
 import os
+import io
 import time
 import json
+import stat
 import base64
-import re
-import urllib.request
 import gzip
+import re
+import ssl
+import ipaddress
+import tempfile
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 
 RE_REMOTE = re.compile(r"^remote\s+\S+\s+([0-9]+)", re.M)
+
+# The relay directory is the trust anchor for every online connection: whatever
+# this URL returns decides which endpoint the user's VPN client is pointed at.
+# It must therefore only ever be fetched over authenticated TLS. There is
+# deliberately no plaintext fallback.
+VPNGATE_FETCH_URL = "https://www.vpngate.net/api/iphone/"
+VPNGATE_ALLOWED_HOSTS = frozenset(("vpngate.net", "www.vpngate.net"))
+CACHE_VERSION = 2
+CACHE_MAX_AGE_SECONDS = 900
+MAX_FETCH_BYTES = 8 * 1024 * 1024
+MAX_CACHE_BYTES = 8 * 1024 * 1024
+MAX_NODES = 512
+MAX_ACCOUNT_NAME_LENGTH = 128
+
+RE_COUNTRY = re.compile(r"^[A-Z]{2}$")
+RE_PORT = re.compile(r"^[0-9]{1,5}$")
+RE_HOSTNAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 
 def get_runtime_dir():
     uid = os.getuid()
@@ -33,32 +57,132 @@ def get_cache_paths():
     paths.append(os.path.join(user_cache, "vpngate-cache.json"))
     return paths
 
+def parse_public_ip(value):
+    """Return a normalized public IP literal, or None for anything else.
+
+    Rejecting non-global addresses keeps loopback, link-local, private and
+    multicast destinations out of the list that is fed to SoftEther.
+    """
+    try:
+        address = ipaddress.ip_address(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if (not address.is_global or address.is_private or address.is_loopback
+            or address.is_link_local or address.is_multicast
+            or address.is_reserved or address.is_unspecified):
+        return None
+    return str(address)
+
+def parse_port(value):
+    text = str(value).strip()
+    if not RE_PORT.match(text):
+        return None
+    port = int(text)
+    return port if 1 <= port <= 65535 else None
+
+def normalize_endpoint(ip, port):
+    address = parse_public_ip(ip)
+    number = parse_port(port)
+    if address is None or number is None:
+        return None
+    return address, number
+
+def valid_account_name(name):
+    if not isinstance(name, str) or not 1 <= len(name) <= MAX_ACCOUNT_NAME_LENGTH:
+        return False
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+        return False
+    # vpncmd parses arguments beginning with / or - as options.
+    return not name.startswith(("/", "-"))
+
+def valid_cached_node(node):
+    if not isinstance(node, dict):
+        return False
+    if parse_public_ip(node.get("ip")) is None:
+        return False
+    port = node.get("port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        return False
+    name = node.get("name")
+    if not isinstance(name, str) or not name or len(name) > MAX_ACCOUNT_NAME_LENGTH:
+        return False
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+        return False
+    return True
+
+def _load_cache_file(path, max_age_seconds):
+    """Load and validate one cache file without following symlinks or races."""
+    fd = -1
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        if info.st_uid != os.getuid() or info.st_nlink != 1:
+            return None
+        if info.st_mode & 0o077:
+            return None
+        if info.st_size <= 0 or info.st_size > MAX_CACHE_BYTES:
+            return None
+        if max_age_seconds is not None and time.time() - info.st_mtime > max_age_seconds:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            data = json.load(handle)
+    except (OSError, ValueError, UnicodeError):
+        return None
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    # Versioned wrapper: caches written by versions that accepted plaintext
+    # HTTP are deliberately ignored instead of being trusted across upgrades.
+    if not isinstance(data, dict) or data.get("version") != CACHE_VERSION:
+        return None
+    if data.get("source") != VPNGATE_FETCH_URL:
+        return None
+    nodes = data.get("nodes")
+    if not isinstance(nodes, list):
+        return None
+    clean = [node for node in nodes[:MAX_NODES] if valid_cached_node(node)]
+    return clean or None
+
 def load_cached_nodes(max_age_seconds=None):
     for path in get_cache_paths():
-        if os.path.isfile(path):
-            try:
-                if max_age_seconds is not None:
-                    mtime = os.path.getmtime(path)
-                    if time.time() - mtime > max_age_seconds:
-                        continue
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, list) and len(data) > 0:
-                        return data
-            except Exception:
-                continue
+        nodes = _load_cache_file(path, max_age_seconds)
+        if nodes:
+            return nodes
     return None
 
 def save_cached_nodes(nodes):
+    payload = {
+        "version": CACHE_VERSION,
+        "fetchedAt": int(time.time()),
+        "source": VPNGATE_FETCH_URL,
+        "nodes": nodes[:MAX_NODES],
+    }
     for path in get_cache_paths():
+        tmp_path = None
         try:
             os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(nodes, f, ensure_ascii=False)
-            os.replace(tmp, path)
+            fd, tmp_path = tempfile.mkstemp(prefix=".vpngate-cache.", dir=os.path.dirname(path))
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+            tmp_path = None
         except Exception:
             pass
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
 def flag_for_country(code):
     if not code or len(code) != 2:
@@ -93,71 +217,100 @@ def format_uptime(ms):
     except Exception:
         return "-"
 
-def fetch_vpngate_nodes(force=False):
-    if not force:
-        cached = load_cached_nodes(max_age_seconds=900)
-        if cached:
-            return cached
+def tls_context():
+    """TLS context that authenticates the relay-directory server."""
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    return context
 
-    urls = [
-        "http://www.vpngate.net/api/iphone/",
-        "https://www.vpngate.net/api/iphone/"
-    ]
+def is_allowed_fetch_url(url):
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+    except (AttributeError, ValueError):
+        return False
+    if parts.scheme.lower() != "https":
+        return False
+    if parts.username is not None or parts.password is not None:
+        return False
+    host = (parts.hostname or "").rstrip(".").lower()
+    if host not in VPNGATE_ALLOWED_HOSTS:
+        return False
+    return port in (None, 443)
 
-    content = None
-    last_err = None
-    for url in urls:
-        try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-                    "Accept-Encoding": "gzip"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=28) as resp:
-                data = resp.read()
-                if data[:2] == b"\x1f\x8b":
-                    try:
-                        data = gzip.decompress(data)
-                    except Exception:
-                        pass
-                decoded = data.decode("utf-8", errors="ignore")
-                if decoded and "*vpn_servers" in decoded:
-                    content = decoded
-                    break
-        except Exception as e:
-            last_err = e
+class HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects that would leave authenticated HTTPS."""
 
-    if not content:
-        # Fall back to older cache if available
-        fallback = load_cached_nodes()
-        if fallback:
-            return fallback
-        sys.stderr.write(f"Failed to fetch VPN Gate nodes: {last_err}\n")
-        return []
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not is_allowed_fetch_url(newurl):
+            if fp is not None:
+                try:
+                    fp.close()
+                except Exception:
+                    pass
+            raise urllib.error.HTTPError(
+                newurl, code, "refused insecure VPN Gate redirect", headers, None)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-    lines = content.splitlines()
+def fetch_remote_content():
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=tls_context()),
+        HttpsOnlyRedirectHandler(),
+    )
+    request = urllib.request.Request(
+        VPNGATE_FETCH_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            "Accept-Encoding": "gzip",
+        },
+    )
+    with opener.open(request, timeout=28) as response:
+        if not is_allowed_fetch_url(response.geturl()):
+            raise ValueError("VPN Gate response came from an untrusted URL")
+        data = response.read(MAX_FETCH_BYTES + 1)
+    if len(data) > MAX_FETCH_BYTES:
+        raise ValueError("VPN Gate response exceeded the size limit")
+    if data[:2] == b"\x1f\x8b":
+        with gzip.GzipFile(fileobj=io.BytesIO(data)) as archive:
+            data = archive.read(MAX_FETCH_BYTES + 1)
+        if len(data) > MAX_FETCH_BYTES:
+            raise ValueError("VPN Gate response exceeded the size limit after decompression")
+    return data.decode("utf-8", errors="replace")
+
+def clean_display_text(value, limit=128):
+    return " ".join(str(value).split())[:limit]
+
+def parse_nodes(content):
     nodes = []
     seen_ips = set()
 
-    for line in lines[2:]:
+    for line in content.splitlines()[2:]:
+        if len(nodes) >= MAX_NODES:
+            break
+        if not line or line.startswith("#") or len(line) > 65536:
+            continue
         parts = line.split(",")
         if len(parts) < 15:
             continue
-        ip = parts[1].strip()
-        if not ip or ip in seen_ips:
+        ip = parse_public_ip(parts[1])
+        if ip is None or ip in seen_ips:
             continue
         seen_ips.add(ip)
 
         hostname = parts[0].strip()
+        if not RE_HOSTNAME.match(hostname):
+            hostname = ""
         ping = int(parts[3]) if parts[3].isdigit() else 999
         speed = int(parts[4]) if parts[4].isdigit() else 0
-        country_long = parts[5].strip()
+        country_long = clean_display_text(parts[5])
         country_short = parts[6].strip().upper()
+        if not RE_COUNTRY.match(country_short):
+            country_short = ""
         sessions = int(parts[7]) if parts[7].isdigit() else 0
         uptime = int(parts[8]) if parts[8].isdigit() else 0
-        operator = parts[12].strip()
+        operator = clean_display_text(parts[12])
 
         port = 443
         b64 = parts[-1].strip()
@@ -166,14 +319,18 @@ def fetch_vpngate_nodes(force=False):
                 ovpn = base64.b64decode(b64).decode("utf-8", errors="ignore")
                 m = RE_REMOTE.search(ovpn)
                 if m:
-                    port = int(m.group(1))
+                    parsed_port = parse_port(m.group(1))
+                    if parsed_port is not None:
+                        port = parsed_port
             except Exception:
                 pass
 
         flag = flag_for_country(country_short)
         account_name = f"#{country_short} {ip}"
 
-        full_hostname = f"{hostname}.opengw.net" if not hostname.endswith(".net") else hostname
+        full_hostname = ""
+        if hostname:
+            full_hostname = hostname if hostname.endswith(".net") else f"{hostname}.opengw.net"
 
         nodes.append({
             "name": account_name,
@@ -194,6 +351,35 @@ def fetch_vpngate_nodes(force=False):
 
     # Sort primarily by speed descending initially
     nodes.sort(key=lambda x: x["speed"], reverse=True)
+    return nodes
+
+def fetch_vpngate_nodes(force=False):
+    if not force:
+        cached = load_cached_nodes(max_age_seconds=CACHE_MAX_AGE_SECONDS)
+        if cached:
+            return cached
+
+    content = None
+    last_err = None
+    try:
+        content = fetch_remote_content()
+    except Exception as e:
+        last_err = e
+
+    nodes = parse_nodes(content) if content else []
+    if not nodes:
+        if last_err is None:
+            last_err = "response contained no valid relays"
+        # Fail closed: reuse only previously validated cache entries. Never
+        # retry over plaintext HTTP, even when the HTTPS fetch is blocked.
+        fallback = load_cached_nodes()
+        if fallback:
+            reason = last_err if last_err is not None else "no valid relays"
+            sys.stderr.write(
+                f"Secure VPN Gate fetch failed; using cached node list: {reason}\n")
+            return fallback
+        sys.stderr.write(f"Failed to fetch VPN Gate nodes over HTTPS: {last_err}\n")
+        return []
 
     save_cached_nodes(nodes)
     return nodes
@@ -201,6 +387,15 @@ def fetch_vpngate_nodes(force=False):
 def add_node(ip, port, name, adapter="VPN"):
     if not ip or not port or not name:
         sys.stderr.write("Usage: add <ip> <port> <name> [adapter]\n")
+        return 1
+
+    endpoint = normalize_endpoint(ip, port)
+    if endpoint is None:
+        sys.stderr.write("Refusing invalid VPN endpoint\n")
+        return 1
+    ip, port = endpoint
+    if not valid_account_name(name):
+        sys.stderr.write("Refusing invalid account name\n")
         return 1
 
     cmd = [
@@ -228,6 +423,12 @@ def direct_node(ip, port, adapter="VPN"):
     if not ip or not port:
         sys.stderr.write("Usage: direct <ip> <port> [adapter]\n")
         return 1
+
+    endpoint = normalize_endpoint(ip, port)
+    if endpoint is None:
+        sys.stderr.write("Refusing invalid VPN endpoint\n")
+        return 1
+    ip, port = endpoint
 
     # First disconnect VPNGate_Direct if it is currently connected,
     # so AccountDelete won't fail with "connection in progress"

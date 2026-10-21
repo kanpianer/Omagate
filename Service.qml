@@ -111,6 +111,44 @@ Item {
     return acc.name || acc.country
   }
 
+  // The relay list is remote input. The helper authenticates and validates it,
+  // and these checks keep any corrupt or tampered entry from reaching vpncmd
+  // through the UI as well.
+  function isEndpointIp(value) {
+    var text = String(value || "").trim()
+    if (text.length < 2 || text.length > 45) return false
+    var v4 = text.match(/^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/)
+    if (v4) {
+      for (var i = 1; i <= 4; i++) {
+        if (Number(v4[i]) > 255) return false
+      }
+      return true
+    }
+    if (text.indexOf(":") < 0 || text.indexOf(".") >= 0 || text.indexOf("%") >= 0) return false
+    if (!/^[0-9A-Fa-f:]+$/.test(text)) return false
+    var compressed = text.indexOf("::")
+    if (compressed !== text.lastIndexOf("::")) return false
+    var groups = text.split(":")
+    var count = 0
+    for (var j = 0; j < groups.length; j++) {
+      if (groups[j] === "") continue
+      if (groups[j].length > 4) return false
+      count++
+    }
+    return compressed >= 0 ? count <= 7 : count === 8
+  }
+
+  function isEndpointPort(value) {
+    var text = String(value || "").trim()
+    if (!/^[0-9]{1,5}$/.test(text)) return false
+    var port = Number(text)
+    return port >= 1 && port <= 65535
+  }
+
+  function isEndpointNode(node) {
+    return !!node && isEndpointIp(node.ip) && isEndpointPort(node.port)
+  }
+
   readonly property string country: {
     if (activeAccount && activeAccount.name === "VPNGate_Direct") {
       return directConnectedNode ? (directConnectedNode.country || "VPN") : "VPN"
@@ -570,6 +608,11 @@ Item {
 
   function addOnlineNode(node) {
     if (!node || !node.ip || !node.port || !node.name) return
+    if (!isEndpointNode(node)) {
+      lastError = "Refusing invalid VPN Gate endpoint"
+      showNotification("Omagate", lastError, true)
+      return
+    }
     if (addOnlineProcess.running) return
     _addOnlineOutput = ""
     _addOnlineError = ""
@@ -580,6 +623,11 @@ Item {
 
   function connectToOnlineNode(node) {
     if (!node || !node.name) return
+    if (!isEndpointNode(node)) {
+      lastError = "Refusing invalid VPN Gate endpoint"
+      showNotification("Omagate", lastError, true)
+      return
+    }
     var targetIp = String(node.ip || "").trim()
     var targetName = String(node.name || "").trim()
     var existing = null
@@ -606,6 +654,11 @@ Item {
       return
     }
     if (busy || !serviceAvailable || !node || !node.ip || !node.port) return
+    if (!isEndpointNode(node)) {
+      lastError = "Refusing invalid VPN Gate endpoint"
+      showNotification("Omagate", lastError, true)
+      return
+    }
 
     var current = activeAccount
     if (current && current.name === "VPNGate_Direct") {
@@ -630,7 +683,13 @@ Item {
   }
 
   function startDirectOnlineProcess(node) {
-    if (!node || !node.ip || !node.port) return
+    if (!isEndpointNode(node)) {
+      lastError = "Refusing invalid VPN Gate endpoint"
+      connectTargetName = ""
+      desiredState = -1
+      stopConnectionTimeout()
+      return
+    }
     startConnectionTimeout()
     directConnectedNode = node
     connectTargetName = "VPNGate_Direct"
@@ -1153,7 +1212,16 @@ Item {
         try {
           var parsed = JSON.parse(stdout)
           if (Array.isArray(parsed)) {
-            root.onlineNodes = parsed
+            var safeNodes = []
+            for (var i = 0; i < parsed.length && safeNodes.length < 512; i++) {
+              if (root.isEndpointNode(parsed[i])) safeNodes.push(parsed[i])
+            }
+            if (safeNodes.length === 0) {
+              root.onlineError = "No usable VPN Gate nodes in the response"
+              root.onlineNodesFetched(false, root.onlineError)
+              return
+            }
+            root.onlineNodes = safeNodes
             root.onlineError = ""
             root.onlineNodesFetched(true, "")
             return

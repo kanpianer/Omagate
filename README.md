@@ -38,6 +38,7 @@ Repository: <https://github.com/kanpianer/Omagate>
 - NetworkManager and `nmcli`.
 - `ip` from `iproute2`, plus the standard `timeout`, `getent`, `flock`, `jq`,
   and coreutils command-line tools included with Omarchy.
+- `ca-certificates`, so the VPN Gate directory can be verified over TLS.
 - A SoftEther virtual adapter and a matching NetworkManager TAP profile (both
   can be created by the built-in setup below).
 - At least one imported account, or an online VPN Gate node.
@@ -127,8 +128,31 @@ privately and published with an atomic rename. Existing symlinks and state with
 unexpected type, ownership, permissions, link count, size, or contents are
 rejected without being followed.
 
+The VPN Gate relay directory determines which endpoint the client connects to,
+so it is fetched only from `https://www.vpngate.net/api/iphone/` with full TLS
+certificate and hostname verification (TLS 1.2 or newer). Redirects are
+followed only while they stay on `vpngate.net` over HTTPS, and there is no
+plaintext HTTP fallback. Parsed relays must have a public unicast IP address
+and a valid port; the helper and the widget both re-validate the endpoint
+before it reaches `vpncmd`. Cached lists are versioned so caches written by
+releases that accepted plaintext HTTP are ignored, and they are stored as
+mode-`0600` regular files that are never read through symlinks or hard links.
+When the HTTPS fetch fails, only a validated cache is reused. VPN Gate does not
+sign the directory payload, so the authenticated HTTPS origin is the trust
+boundary; the list is never accepted from any other origin.
+
 Omarchy plugins execute as unsandboxed user code. Review the source before
 enabling any third-party plugin.
+
+## Tests
+
+```bash
+node test/model-state.test.js
+node test/country-lookup.test.js
+node test/service-endpoint.test.js
+python3 test/vpngate-helper.test.py
+bash test/security-hardening.test.sh
+```
 
 ## Updating
 
